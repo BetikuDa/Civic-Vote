@@ -1,11 +1,16 @@
+import hashlib
+import hmac
+import secrets
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import select
+from sqlalchemy import func, inspect, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -14,43 +19,12 @@ from database import Base, engine, get_db
 from schemas import PostCreate, PostResponse, UserCreate, UserResponse
 
 
-SESSION_COOKIE = "voting_session"
-CSRF_COOKIE = "voting_csrf"
-SESSION_DURATION_SECONDS = 14 * 24 * 60 * 60
-PASSWORD_HASH_ITERATIONS = 310_000
-
 Base.metadata.create_all(bind=engine)
-
-candidate_defaults = [
-    models.Candidate(
-        name="Bola Ahmed TINUBUUUUUUUU!!!!!",
-        party="ALL PROGRESSIVE CONGRESS(APC)",
-        description="4+4 Emi Lo Kan.",
-    ),
-    models.Candidate(
-        name="Peter Gregory Obi",
-        party="NIGERIA DEMOCRATIC CONGRESS(NDC)",
-        description="From consumption to production.",
-    ),
-]
-
-db = next(get_db())
-try:
-    existing_candidates = db.scalars(
-        select(models.Candidate).order_by(models.Candidate.id)
-    ).all()
-    if not existing_candidates:
-        db.add_all(candidate_defaults)
-        db.commit()
-    else:
-        for candidate, default in zip(existing_candidates, candidate_defaults):
-            if candidate.name in {"Candidate One", "Candidate Two"}:
-                candidate.name = default.name
-                candidate.party = default.party
-                candidate.description = default.description
-        db.commit()
-finally:
-    db.close()
+if "password_hash" not in {
+    column["name"] for column in inspect(engine).get_columns("users")
+}:
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE users ADD COLUMN password_hash VARCHAR(256)"))
 
 
 app = FastAPI(title="Civic Vote")
@@ -58,526 +32,323 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 app.mount("/media", StaticFiles(directory="media"), name="media")
 templates = Jinja2Templates(directory="templates")
 
+SESSION_COOKIE = "civic_session"
+PASSWORD_ITERATIONS = 310_000
+SESSION_LIFETIME = timedelta(days=7)
 
-def _utc_now():
-    return models.datetime.now(models.UTC).replace(tzinfo=None)
 
-
-def _hash_password(password: str) -> str:
-    salt = models.secrets.token_bytes(16)
-    digest = models.hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), salt, PASSWORD_HASH_ITERATIONS
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, PASSWORD_ITERATIONS
     )
-    return (
-        f"pbkdf2_sha256${PASSWORD_HASH_ITERATIONS}"
-        f"${salt.hex()}${digest.hex()}"
-    )
+    return f"pbkdf2_sha256${PASSWORD_ITERATIONS}${salt.hex()}${password_hash.hex()}"
 
 
-def _verify_password(password: str, stored_hash: str | None) -> bool:
+def verify_password(password: str, stored_hash: str | None) -> bool:
     if not stored_hash:
         return False
     try:
-        algorithm, iterations_text, salt_text, expected = stored_hash.split("$")
-        iterations = int(iterations_text)
-        if algorithm != "pbkdf2_sha256" or not 1 <= iterations <= 1_000_000:
+        algorithm, iterations, salt, expected_hash = stored_hash.split("$")
+        if algorithm != "pbkdf2_sha256":
             return False
-        actual = models.hashlib.pbkdf2_hmac(
-            "sha256", password.encode("utf-8"), bytes.fromhex(salt_text), iterations
+        actual_hash = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), bytes.fromhex(salt), int(iterations)
         ).hex()
-    except (TypeError, ValueError):
+        return hmac.compare_digest(actual_hash, expected_hash)
+    except (ValueError, TypeError):
         return False
-    return models.hmac.compare_digest(actual, expected)
 
 
-def _csrf_token() -> str:
-    return models.secrets.token_urlsafe(32)
+def get_authentication(request: Request, db: Session):
+    token = request.cookies.get(SESSION_COOKIE)
+    if not token:
+        return None, None
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    auth_session = db.execute(
+        select(models.LoginSession).where(models.LoginSession.token_hash == token_hash)
+    ).scalars().first()
+    if not auth_session:
+        return None, None
+    if auth_session.expires_at < datetime.now(UTC).replace(tzinfo=None):
+        return None, None
+    user = db.get(models.User, auth_session.user_id)
+    if not user:
+        return None, None
+    return user, auth_session
 
 
-def _set_csrf_cookie(response, request: Request, token: str) -> None:
-    response.set_cookie(
-        CSRF_COOKIE,
-        token,
-        max_age=SESSION_DURATION_SECONDS,
-        httponly=True,
-        secure=request.url.scheme == "https",
-        samesite="lax",
-        path="/",
+def create_authentication(user: models.User, db: Session, request: Request):
+    token = secrets.token_urlsafe(32)
+    auth_session = models.LoginSession(
+        user_id=user.id,
+        token_hash=hashlib.sha256(token.encode("utf-8")).hexdigest(),
+        csrf_token=secrets.token_urlsafe(32),
+        expires_at=datetime.now(UTC).replace(tzinfo=None) + SESSION_LIFETIME,
     )
-
-
-def _set_session_cookies(response, request: Request, raw_token: str, csrf_token: str) -> None:
+    db.add(auth_session)
+    db.commit()
+    response = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
     response.set_cookie(
         SESSION_COOKIE,
-        raw_token,
-        max_age=SESSION_DURATION_SECONDS,
+        token,
+        max_age=int(SESSION_LIFETIME.total_seconds()),
         httponly=True,
         secure=request.url.scheme == "https",
         samesite="lax",
         path="/",
     )
-    _set_csrf_cookie(response, request, csrf_token)
-
-
-def _get_login_session(request: Request, db: Session) -> models.LoginSession | None:
-    raw_token = request.cookies.get(SESSION_COOKIE)
-    if not raw_token:
-        return None
-    token_hash = models.hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
-    return db.scalar(
-        select(models.LoginSession)
-        .where(
-            models.LoginSession.token_hash == token_hash,
-            models.LoginSession.expires_at > _utc_now(),
-        )
-        .limit(1)
-    )
-
-
-def _valid_csrf(
-    request: Request, submitted_token: str, login_session: models.LoginSession | None
-) -> bool:
-    cookie_token = request.cookies.get(CSRF_COOKIE, "")
-    return bool(
-        cookie_token
-        and models.hmac.compare_digest(cookie_token, submitted_token)
-        and (
-            login_session is None
-            or models.hmac.compare_digest(login_session.csrf_token, submitted_token)
-        )
-    )
-
-
-def _create_login_session(
-    db: Session, user: models.VotingUser
-) -> tuple[str, str]:
-    raw_token = models.secrets.token_urlsafe(32)
-    csrf_token = _csrf_token()
-    db.add(
-        models.LoginSession(
-            user_id=user.id,
-            token_hash=models.hashlib.sha256(raw_token.encode("utf-8")).hexdigest(),
-            csrf_token=csrf_token,
-            expires_at=_utc_now() + models.timedelta(seconds=SESSION_DURATION_SECONDS),
-        )
-    )
-    db.commit()
-    return raw_token, csrf_token
-
-
-def _redirect(location: str):
-    return JSONResponse(
-        content=None,
-        status_code=status.HTTP_303_SEE_OTHER,
-        headers={"Location": location},
-    )
-
-
-def _account_page(
-    request: Request,
-    page: str,
-    *,
-    message: str | None = None,
-    username: str = "",
-    email: str = "",
-    status_code: int = 200,
-):
-    csrf_token = request.cookies.get(CSRF_COOKIE) or _csrf_token()
-    response = templates.TemplateResponse(
-        request,
-        "account.html",
-        {
-            "page": page,
-            "title": "Create account" if page == "register" else "Sign in",
-            "csrf_token": csrf_token,
-            "message": message,
-            "username": username,
-            "email": email,
-        },
-        status_code=status_code,
-    )
-    if request.cookies.get(CSRF_COOKIE) != csrf_token:
-        _set_csrf_cookie(response, request, csrf_token)
     return response
 
 
-def _candidate_results(db: Session) -> tuple[list[dict], int]:
-    rows = db.execute(
-        select(models.Candidate, models.Vote.id)
-        .outerjoin(models.Vote, models.Vote.candidate_id == models.Candidate.id)
-        .order_by(models.Candidate.id)
-    ).all()
-    candidates = {}
-    vote_counts = {}
-    for candidate, vote_id in rows:
-        candidates[candidate.id] = candidate
-        vote_counts[candidate.id] = vote_counts.get(candidate.id, 0) + (
-            1 if vote_id is not None else 0
-        )
-    total_votes = sum(vote_counts.values())
-    results = [
+def verify_csrf(request: Request, auth_session: models.LoginSession, token: str):
+    if not hmac.compare_digest(auth_session.csrf_token, token):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Your form expired. Please try again.")
+
+
+def election_results(db: Session):
+    candidates = db.execute(
+        select(models.Candidate).order_by(models.Candidate.position)
+    ).scalars().all()
+    counts = {
+        candidate_id: vote_count
+        for candidate_id, vote_count in db.execute(
+            select(models.Vote.candidate_id, func.count(models.Vote.id))
+            .group_by(models.Vote.candidate_id)
+        ).all()
+    }
+    total_votes = sum(counts.values())
+    return [
         {
-            "candidate": candidates[candidate_id],
-            "votes": vote_counts[candidate_id],
-            "percentage": round(vote_counts[candidate_id] * 100 / total_votes)
+            "candidate": candidate,
+            "votes": counts.get(candidate.id, 0),
+            "percentage": round(counts.get(candidate.id, 0) * 100 / total_votes)
             if total_votes
             else 0,
         }
-        for candidate_id in candidates
-    ]
-    return results, total_votes
+        for candidate in candidates
+    ], total_votes
+
+
+def render_auth(request: Request, mode: str, error: str | None = None, status_code: int = 200):
+    return templates.TemplateResponse(
+        request,
+        "auth.html",
+        {"title": "Create your account" if mode == "register" else "Sign in", "mode": mode, "error": error},
+        status_code=status_code,
+    )
 
 
 @app.get("/", include_in_schema=False)
 def home(request: Request, db: Annotated[Session, Depends(get_db)]):
-    login_session = _get_login_session(request, db)
-    results, total_votes = _candidate_results(db)
-    has_voted = (
-        login_session is not None
-        and db.scalar(
-            select(models.Vote.id)
-            .where(models.Vote.user_id == login_session.user_id)
-            .limit(1)
-        )
-        is not None
+    if not db.execute(select(models.Candidate.id)).first():
+        return templates.TemplateResponse(request, "setup.html", {"title": "Set up the election"})
+    user, auth_session = get_authentication(request, db)
+    results, total_votes = election_results(db)
+    has_voted = bool(
+        user
+        and db.execute(
+            select(models.Vote.id).where(models.Vote.user_id == user.id)
+        ).first()
     )
-    csrf_token = (
-        login_session.csrf_token
-        if login_session
-        else request.cookies.get(CSRF_COOKIE) or _csrf_token()
-    )
-    response = templates.TemplateResponse(
+    return templates.TemplateResponse(
         request,
         "home.html",
         {
-            "title": "Cast your vote",
-            "candidates": results,
+            "title": "Your vote. Your voice.",
+            "user": user,
+            "csrf_token": auth_session.csrf_token if auth_session else "",
+            "results": results,
             "total_votes": total_votes,
-            "current_user": login_session.user if login_session else None,
             "has_voted": has_voted,
-            "csrf_token": csrf_token,
-            "notice": request.query_params.get("notice"),
         },
     )
-    if request.cookies.get(CSRF_COOKIE) != csrf_token:
-        _set_csrf_cookie(response, request, csrf_token)
-    return response
+
+
+@app.post("/setup", include_in_schema=False)
+async def setup_election(request: Request, db: Annotated[Session, Depends(get_db)]):
+    form = await request.form()
+    names = [str(form.get("candidate_one", "")).strip(), str(form.get("candidate_two", "")).strip()]
+    if any(not name or len(name) > 80 for name in names) or names[0].casefold() == names[1].casefold():
+        return templates.TemplateResponse(
+            request,
+            "setup.html",
+            {"title": "Set up the election", "error": "Enter two different candidate names (up to 80 characters each)."},
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+    if db.execute(select(models.Candidate.id)).first():
+        return RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
+    db.add_all(
+        [
+            models.Candidate(name=names[0], position=1),
+            models.Candidate(name=names[1], position=2),
+        ]
+    )
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if db.execute(select(models.Candidate.id)).first():
+            return RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="The election could not be created.")
+    return RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.get("/register", include_in_schema=False)
 def register_page(request: Request):
-    return _account_page(request, "register")
+    return render_auth(request, "register")
 
 
 @app.post("/register", include_in_schema=False)
 async def register(request: Request, db: Annotated[Session, Depends(get_db)]):
     form = await request.form()
-    username = str(form.get("username", ""))
-    email = str(form.get("email", ""))
+    username = str(form.get("username", "")).strip()
+    email = str(form.get("email", "")).strip().lower()
     password = str(form.get("password", ""))
-    csrf_token = str(form.get("csrf_token", ""))
-    if not _valid_csrf(request, csrf_token, None):
-        return _account_page(
-            request, "register", message="Your form expired. Please try again.", status_code=403
-        )
-    clean_username = username.strip()
-    clean_email = email.strip().lower()
-    if not clean_username or len(clean_username) > 50:
-        return _account_page(
-            request,
-            "register",
-            message="Enter a username of up to 50 characters.",
-            email=clean_email,
-            status_code=400,
-        )
-    if (
-        len(clean_email) > 120
-        or "@" not in clean_email
-        or "." not in clean_email.rsplit("@", 1)[-1]
-    ):
-        return _account_page(
-            request,
-            "register",
-            message="Enter a valid email address.",
-            username=clean_username,
-            status_code=400,
-        )
+    if not username or len(username) > 50:
+        return render_auth(request, "register", "Choose a username up to 50 characters.", 400)
+    if len(email) > 120 or "@" not in email:
+        return render_auth(request, "register", "Enter a valid email address.", 400)
     if len(password) < 8 or len(password) > 128:
-        return _account_page(
-            request,
-            "register",
-            message="Your password must be between 8 and 128 characters.",
-            username=clean_username,
-            email=clean_email,
-            status_code=400,
+        return render_auth(request, "register", "Your password must be between 8 and 128 characters.", 400)
+    if db.execute(
+        select(models.User.id).where(
+            (models.User.username == username) | (models.User.email == email)
         )
-    existing_user = db.scalar(
-        select(models.VotingUser).where(
-            (models.VotingUser.username == clean_username)
-            | (models.VotingUser.email == clean_email)
-        )
-    )
-    if existing_user:
-        message = (
-            "That username is already taken."
-            if existing_user.username == clean_username
-            else "An account with that email already exists."
-        )
-        return _account_page(
-            request,
-            "register",
-            message=message,
-            username=clean_username,
-            status_code=409,
-        )
-
-    user = models.VotingUser(
-        username=clean_username,
-        email=clean_email,
-        password_hash=_hash_password(password),
-    )
+    ).first():
+        return render_auth(request, "register", "That username or email is already registered.", 400)
+    user = models.User(username=username, email=email, password_hash=hash_password(password))
     db.add(user)
     try:
         db.commit()
-    except models.IntegrityError:
+    except IntegrityError:
         db.rollback()
-        return _account_page(
-            request,
-            "register",
-            message="That username or email is already in use.",
-            username=clean_username,
-            status_code=409,
-        )
+        if db.execute(
+            select(models.User.id).where(
+                (models.User.username == username) | (models.User.email == email)
+            )
+        ).first():
+            return render_auth(request, "register", "That username or email is already registered.", 400)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Your account could not be created.")
     db.refresh(user)
-    raw_token, session_csrf = _create_login_session(db, user)
-    response = _redirect("/")
-    _set_session_cookies(response, request, raw_token, session_csrf)
-    return response
+    return create_authentication(user, db, request)
 
 
 @app.get("/login", include_in_schema=False)
 def login_page(request: Request):
-    return _account_page(request, "login", message=request.query_params.get("notice"))
+    return render_auth(request, "login")
 
 
 @app.post("/login", include_in_schema=False)
 async def login(request: Request, db: Annotated[Session, Depends(get_db)]):
     form = await request.form()
-    username = str(form.get("username", ""))
+    identifier = str(form.get("identifier", "")).strip()
     password = str(form.get("password", ""))
-    csrf_token = str(form.get("csrf_token", ""))
-    if not _valid_csrf(request, csrf_token, None):
-        return _account_page(
-            request, "login", message="Your form expired. Please try again.", status_code=403
+    user = db.execute(
+        select(models.User).where(
+            (models.User.username == identifier) | (models.User.email == identifier.lower())
         )
-    user = db.scalar(
-        select(models.VotingUser).where(
-            models.VotingUser.username == username.strip()
-        )
-    )
-    if not user or not _verify_password(password, user.password_hash):
-        return _account_page(
-            request,
-            "login",
-            message="The username or password is incorrect.",
-            username=username.strip(),
-            status_code=401,
-        )
-    raw_token, session_csrf = _create_login_session(db, user)
-    response = _redirect("/")
-    _set_session_cookies(response, request, raw_token, session_csrf)
-    return response
+    ).scalars().first()
+    if not user or not verify_password(password, user.password_hash):
+        return render_auth(request, "login", "The username/email or password is incorrect.", 401)
+    return create_authentication(user, db, request)
 
 
 @app.post("/logout", include_in_schema=False)
 async def logout(request: Request, db: Annotated[Session, Depends(get_db)]):
+    user, auth_session = get_authentication(request, db)
+    if not user or not auth_session:
+        return RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
     form = await request.form()
-    csrf_token = str(form.get("csrf_token", ""))
-    login_session = _get_login_session(request, db)
-    if not _valid_csrf(request, csrf_token, login_session):
-        raise HTTPException(status_code=403, detail="Your form expired. Please try again.")
-    if login_session:
-        db.delete(login_session)
-        db.commit()
-    response = _redirect("/")
+    verify_csrf(request, auth_session, str(form.get("csrf_token", "")))
+    db.delete(auth_session)
+    db.commit()
+    response = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
     response.delete_cookie(SESSION_COOKIE, path="/", samesite="lax")
-    response.delete_cookie(CSRF_COOKIE, path="/", samesite="lax")
     return response
 
 
 @app.post("/vote", include_in_schema=False)
 async def cast_vote(request: Request, db: Annotated[Session, Depends(get_db)]):
+    user, auth_session = get_authentication(request, db)
+    if not user or not auth_session:
+        return RedirectResponse("/login", status_code=status.HTTP_303_SEE_OTHER)
     form = await request.form()
-    candidate_id_value = str(form.get("candidate_id", ""))
-    csrf_token = str(form.get("csrf_token", ""))
-    login_session = _get_login_session(request, db)
-    if not login_session:
-        return _redirect("/login?notice=Sign+in+before+you+vote.")
-    if not _valid_csrf(request, csrf_token, login_session):
-        raise HTTPException(status_code=403, detail="Your form expired. Please try again.")
-    if not candidate_id_value.isdecimal():
-        raise HTTPException(status_code=422, detail="Choose a valid candidate.")
-    candidate_id = int(candidate_id_value)
-    candidate = db.get(models.Candidate, candidate_id)
+    verify_csrf(request, auth_session, str(form.get("csrf_token", "")))
+    candidate_id = form.get("candidate_id")
+    if not candidate_id or not str(candidate_id).isdigit():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Choose one of the candidates.")
+    candidate = db.get(models.Candidate, int(candidate_id))
     if not candidate:
-        raise HTTPException(status_code=404, detail="That candidate is not on the ballot.")
-    existing_vote = db.scalar(
-        select(models.Vote.id)
-        .where(models.Vote.user_id == login_session.user_id)
-        .limit(1)
-    )
-    if existing_vote:
-        return _redirect("/?notice=Your+vote+has+already+been+recorded.")
-
-    db.add(
-        models.Vote(
-            user_id=login_session.user_id,
-            candidate_id=candidate.id,
-        )
-    )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Choose one of the candidates.")
+    db.add(models.Vote(user_id=user.id, candidate_id=candidate.id))
     try:
         db.commit()
-    except models.IntegrityError:
+    except IntegrityError:
         db.rollback()
-        existing_vote = db.scalar(
-            select(models.Vote.id)
-            .where(models.Vote.user_id == login_session.user_id)
-            .limit(1)
-        )
-        if not existing_vote:
-            raise
-        return _redirect("/?notice=Your+vote+has+already+been+recorded.")
-    return _redirect("/?notice=Your+vote+has+been+recorded.+Thank+you.")
+        if db.execute(
+            select(models.Vote.id).where(models.Vote.user_id == user.id)
+        ).first():
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Your account has already voted.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Your vote could not be recorded.")
+    return RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.get("/results", include_in_schema=False)
 def results_page(request: Request, db: Annotated[Session, Depends(get_db)]):
-    results, total_votes = _candidate_results(db)
-    login_session = _get_login_session(request, db)
-    csrf_token = (
-        login_session.csrf_token
-        if login_session
-        else request.cookies.get(CSRF_COOKIE) or _csrf_token()
-    )
-    response = templates.TemplateResponse(
+    results, total_votes = election_results(db)
+    return templates.TemplateResponse(
         request,
         "results.html",
-        {
-            "title": "Election results",
-            "results": results,
-            "total_votes": total_votes,
-            "current_user": login_session.user if login_session else None,
-            "csrf_token": csrf_token,
-        },
+        {"title": "Election results", "results": results, "total_votes": total_votes},
     )
-    if request.cookies.get(CSRF_COOKIE) != csrf_token:
-        _set_csrf_cookie(response, request, csrf_token)
-    return response
 
 
-@app.get("/api/candidates")
-def get_candidates(db: Annotated[Session, Depends(get_db)]):
-    return db.scalars(select(models.Candidate).order_by(models.Candidate.id)).all()
-
-
-@app.get("/api/results")
-def get_results(db: Annotated[Session, Depends(get_db)]):
-    results, total_votes = _candidate_results(db)
-    return {
-        "total_votes": total_votes,
-        "results": [
-            {
-                "candidate_id": item["candidate"].id,
-                "candidate_name": item["candidate"].name,
-                "party": item["candidate"].party,
-                "votes": item["votes"],
-                "percentage": item["percentage"],
-            }
-            for item in results
-        ],
-    }
-
-
-@app.post(
-    "/api/users",
-    response_model=UserResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-def create_user(user: UserCreate, db: Annotated[Session, Depends(get_db)]):
-    existing_user = db.scalar(
-        select(models.User).where(
-            (models.User.username == user.username) | (models.User.email == user.email)
+@app.post("/api/users", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+def create_user_api(user: UserCreate, db: Annotated[Session, Depends(get_db)]):
+    if db.execute(
+        select(models.User.id).where(
+            (models.User.username == user.username) | (models.User.email == str(user.email).lower())
         )
-    )
-    if existing_user:
-        detail = (
-            "Username Already Exists"
-            if existing_user.username == user.username
-            else "Email Already Registered"
-        )
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
-
+    ).first():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username or email is already registered")
     new_user = models.User(
         username=user.username,
-        email=user.email,
+        email=str(user.email).lower(),
+        password_hash=hash_password(user.password),
     )
     db.add(new_user)
-    try:
-        db.commit()
-    except models.IntegrityError:
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username or email is already registered",
-        )
+    db.commit()
     db.refresh(new_user)
     return new_user
 
 
-@app.get("/api/users/{user_id}", name="get_user_api", response_model=UserResponse)
-def get_user(user_id: int, db: Annotated[Session, Depends(get_db)]):
+@app.get("/api/users/{user_id}", response_model=UserResponse)
+def get_user_api(user_id: int, db: Annotated[Session, Depends(get_db)]):
     user = db.get(models.User, user_id)
-    if user:
-        return user
-    raise HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail=f"User with ID {user_id} Was Not Found",
-    )
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"User with ID {user_id} was not found")
+    return user
 
 
 @app.get("/api/posts", response_model=list[PostResponse])
-def get_posts(db: Annotated[Session, Depends(get_db)]):
-    return db.scalars(select(models.Post)).all()
+def get_posts_api(db: Annotated[Session, Depends(get_db)]):
+    return db.execute(select(models.Post)).scalars().all()
 
 
 @app.get("/api/posts/{post_id}", response_model=PostResponse)
-def get_post(post_id: int, db: Annotated[Session, Depends(get_db)]):
+def get_post_api(post_id: int, db: Annotated[Session, Depends(get_db)]):
     post = db.get(models.Post, post_id)
-    if post:
-        return post
-    raise HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail=f"Post {post_id} Was Not Found",
-    )
+    if not post:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Post {post_id} was not found")
+    return post
 
 
-@app.post(
-    "/api/posts",
-    response_model=PostResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-def create_post(post: PostCreate, db: Annotated[Session, Depends(get_db)]):
-    user = db.get(models.User, post.user_id)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"User with ID - {post.user_id} not found",
-        )
-    new_post = models.Post(
-        title=post.title,
-        content=post.content,
-        user_id=post.user_id,
-    )
+@app.post("/api/posts", response_model=PostResponse, status_code=status.HTTP_201_CREATED)
+def create_post_api(post: PostCreate, db: Annotated[Session, Depends(get_db)]):
+    if not db.get(models.User, post.user_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"User with ID {post.user_id} not found")
+    new_post = models.Post(title=post.title, content=post.content, user_id=post.user_id)
     db.add(new_post)
     db.commit()
     db.refresh(new_post)
@@ -586,42 +357,23 @@ def create_post(post: PostCreate, db: Annotated[Session, Depends(get_db)]):
 
 @app.exception_handler(StarletteHTTPException)
 def http_exception_handler(request: Request, exception: StarletteHTTPException):
-    message = (
-        exception.detail
-        if exception.detail
-        else "An error occurred while processing your request. Please try again later."
-    )
     if request.url.path.startswith("/api"):
-        return JSONResponse(
-            status_code=exception.status_code,
-            content={"detail": message},
-        )
+        return JSONResponse(status_code=exception.status_code, content={"detail": exception.detail})
     return templates.TemplateResponse(
         request,
         "error.html",
-        {
-            "status_code": exception.status_code,
-            "title": str(exception.status_code),
-            "message": message,
-        },
+        {"status_code": exception.status_code, "title": "Something went wrong", "message": exception.detail},
         status_code=exception.status_code,
     )
 
 
 @app.exception_handler(RequestValidationError)
-def general_http_exception_handler(request: Request, exception: RequestValidationError):
+def validation_exception_handler(request: Request, exception: RequestValidationError):
     if request.url.path.startswith("/api"):
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            content={"detail": exception.errors()},
-        )
+        return JSONResponse(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, content={"detail": exception.errors()})
     return templates.TemplateResponse(
         request,
         "error.html",
-        {
-            "status_code": status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "title": str(status.HTTP_422_UNPROCESSABLE_ENTITY),
-            "message": "Invalid request. Please check your input and try again.",
-        },
+        {"status_code": status.HTTP_422_UNPROCESSABLE_ENTITY, "title": "Invalid request", "message": "Please check your input and try again."},
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
     )
